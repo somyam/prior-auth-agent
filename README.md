@@ -1,125 +1,96 @@
 # Prior Auth Agent
 
-A small agent that answers one question — should this procedure be approved
-under Medicare policy? — and shows exactly how it got there.
+A policy-grounded prior authorization agent that evaluates whether a requested procedure meets Medicare coverage criteria and produces an auditable rationale tied to retrieved CMS policy language.
 
-Manual prior-auth review means a person reading a procedure request
-alongside a lengthy coverage policy and cross-checking one against the
-other. This project automates that cross-check: retrieve the relevant
-policy language, hand it to the model along with the patient's record, and
-require the model to point at the specific clause its decision rests on.
-No clause, no decision.
+The system automates a common prior authorization workflow: matching a procedure request and patient record against applicable coverage criteria. Rather than relying on the model's internal knowledge of Medicare policy, it retrieves relevant policy text and requires each model-generated decision to include a supporting citation.
 
-## Design
+## Architecture
 
-The request moves through a fixed sequence of steps, modeled as a
-[LangGraph](https://github.com/langchain-ai/langgraph) graph rather than a
-single long function — each step is an isolated node, and the graph branches
-on real conditions instead of silently falling through:
+Requests move through a fixed workflow implemented as a [LangGraph](https://github.com/langchain-ai/langgraph) state graph. Each stage is represented as an isolated node, with explicit conditional routing for cases that should not proceed to model inference.
 
-```
+```text
                  ┌──────────────────┐
-   diagnosis ──> │  patient lookup   │
-   lookup        └────────┬──────────┘
-                           │
-              ┌────────────┴────────────┐
-        patient on file           no matching patient
-              │                          │
-              ▼                          ▼
+   diagnosis ──> │  patient lookup  │
+   lookup        └────────┬─────────┘
+                          │
+              ┌───────────┴────────────┐
+        patient found            patient not found
+              │                         │
+              ▼                         ▼
       policy retrieval             auto-deny
-              │                          │
-              ▼                          │
-        model decision                   │
-              │                          │
-              └───────────┬──────────────┘
-                           ▼
-                      audit record
+              │                         │
+              ▼                         │
+        model decision                  │
+              │                         │
+              └───────────┬─────────────┘
+                          ▼
+                     audit record
 ```
 
-A request for an unrecognized patient never reaches the model — it's
-denied and logged automatically, which also means the model is never asked
-to reason about a patient it can't actually verify.
+If no matching patient record is found, the request is denied and logged without invoking the model. This prevents inference against an unverified or unavailable patient record.
 
-## Grounding the decision
+## Policy Grounding
 
-The model doesn't get to reference what it remembers about Medicare policy.
-The three CMS Local Coverage Determinations in `docs/cms_policies/` are
-split into chunks, embedded, and indexed with FAISS at startup. Each
-request embeds the procedure being requested, pulls the closest matching
-chunks, and only that retrieved text is placed in front of the model —
-along with an explicit instruction to quote the clause it used. That
-citation is what makes the decision checkable after the fact rather than
-just plausible-sounding.
+The model is restricted to retrieved CMS policy text rather than its pretrained knowledge of Medicare coverage rules.
 
-## What's in each file
+Three CMS Local Coverage Determinations (LCDs) in `docs/cms_policies/` are:
 
-| File | Responsibility |
-|---|---|
-| `graph.py` | Defines the state graph: nodes, the patient-found branch, the decision prompt |
-| `tools.py` | Diagnosis code lookup, patient record lookup, FAISS policy search |
-| `index.py` | Chunks and embeds the policy PDFs, caches the index to `.cache/` |
-| `audit.py` | Writes every decision — approvals, denials, and auto-denials — to SQLite |
-| `app.py` | Streamlit form for submitting a request and browsing the audit log |
-| `data/patients.csv` | Synthetic patient records (no real PHI) |
-| `docs/cms_policies/` | The three CMS LCD PDFs the agent retrieves from |
-| `eval/` | Eval harness — see [Evaluation](#evaluation) |
+1. Parsed and split into chunks.
+2. Embedded and indexed with FAISS at startup.
+3. Retrieved using the requested procedure as the search query.
+4. Passed to the model alongside the relevant patient record.
 
-## Running it
+The decision prompt requires the model to identify the specific policy language supporting its conclusion. This provides a traceable relationship between the generated decision and the retrieved source material and allows citations to be evaluated independently for groundedness.
+
+## Repository Structure
+
+| File                 | Responsibility                                                            |
+| -------------------- | ------------------------------------------------------------------------- |
+| `graph.py`           | Defines the LangGraph workflow, conditional routing, and decision prompt  |
+| `tools.py`           | Diagnosis-code lookup, patient-record lookup, and FAISS policy retrieval  |
+| `index.py`           | Parses, chunks, and embeds CMS policy PDFs and caches the resulting index |
+| `audit.py`           | Persists approvals, denials, and automatic denials to SQLite              |
+| `app.py`             | Streamlit interface for submitting requests and reviewing the audit log   |
+| `data/patients.csv`  | Synthetic patient records; contains no real PHI                           |
+| `docs/cms_policies/` | CMS Local Coverage Determination PDFs used for retrieval                  |
+| `eval/`              | Evaluation cases and evaluation harness                                   |
+
+## Running Locally
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # add your AWS Bedrock credentials
+cp .env.example .env   # add AWS Bedrock credentials
 streamlit run app.py
 ```
 
-The first run builds the FAISS index from the policy PDFs and caches it;
-later runs load straight from `.cache/`.
+On the first run, the application builds a FAISS index from the policy PDFs and stores it in `.cache/`. Subsequent runs load the cached index.
 
 ## Evaluation
 
-The synthetic patient records don't carry the clinical detail (symptom
-duration, documented conservative-therapy trials, screening intervals)
-that the actual CMS criteria hinge on, so there's no ground truth for
-"was this specific decision clinically correct." `eval/run_eval.py`
-measures what's actually verifiable instead, against a 20-case set in
-`eval/cases.jsonl`:
+The synthetic patient records do not contain all of the clinical variables required to determine Medicare coverage for every procedure, such as symptom duration, prior conservative treatment, or screening intervals. As a result, the evaluation does **not** treat model decisions as clinically validated ground truth.
 
-- **Auto-deny routing** — an unknown patient ID must be denied without
-  ever reaching the model. 4/4.
-- **Diagnosis/procedure mismatch** — a request where the diagnosis has
-  nothing to do with the procedure (a GI diagnosis requesting a knee
-  replacement, say) must be denied regardless of patient history, since
-  no policy would support it. 8/8.
-- **Citation groundedness** — how much of the model's cited policy text
-  is actually traceable, word-for-word, to the chunks it was given, as a
-  proxy for hallucinated citations. ~0.90 average.
-- **Format compliance** — does the response parse into
-  DECISION/REASONING/POLICY CITATION. 100%.
+Instead, `eval/run_eval.py` evaluates properties that can be verified directly against a 20-case test set in `eval/cases.jsonl`:
 
-A remaining bucket of "aligned" cases (diagnosis and procedure in the
-same clinical category, e.g. low back pain + lumbar MRI) has no
-assignable ground truth, so those run and get logged but aren't scored
-for accuracy — useful for spot-checking reasoning quality, not a
-pass/fail number.
+* **Auto-deny routing — 4/4:** Requests containing an unknown patient ID must be denied without invoking the model.
+* **Diagnosis/procedure mismatch — 8/8:** Requests with an unrelated diagnosis and procedure must be denied when the retrieved policy provides no basis for coverage.
+* **Citation groundedness — ~0.90 mean:** Measures the extent to which cited policy text can be traced verbatim to the retrieved context supplied to the model. This is used as a proxy for unsupported or hallucinated citations.
+* **Output-format compliance — 100%:** Measures whether responses conform to the required `DECISION / REASONING / POLICY CITATION` structure.
 
-Running the eval is also what surfaced a real reliability bug: Llama
-3.1 8B would occasionally fall into a repetition loop at low temperature
-and burn its whole generation budget without ever producing a policy
-citation. `graph.py` now detects that pattern and retries with escalating
-temperature, falling back to an explicit deny-and-flag-for-review result
-if it still can't produce a well-formed, cited decision.
+Cases in which the diagnosis and procedure are clinically aligned—for example, low back pain with lumbar MRI—are executed and logged but are not assigned an accuracy score. The available synthetic records do not contain enough information to establish a defensible coverage ground truth for these cases. They are therefore intended for qualitative review of retrieval and reasoning behavior.
+
+### Failure Handling
+
+Evaluation identified a generation reliability issue with Llama 3.1 8B: in some cases, the model entered a repetition loop and exhausted its generation budget before producing the required policy citation.
+
+`graph.py` includes explicit handling for this failure mode. It detects malformed or repetitive output and retries generation with an increased temperature. If repeated attempts still fail to produce a valid cited response, the request returns a deny-and-flag-for-review result rather than treating an incomplete generation as a valid decision.
+
+Run the evaluation suite with:
 
 ```bash
 PYTHONPATH=. python3 eval/run_eval.py
 ```
 
-## Known gaps
+## Scope
 
-- The model returns a binary decision with no confidence signal — there's
-  no way to distinguish a clear-cut case from a borderline one it decided
-  anyway.
-- Every audit record lives in one local SQLite file; there's no
-  multi-writer story if this ran as more than a single-user demo.
-
-Patient data is synthetic throughout. No real PHI is used at any stage.
+This repository is a prototype for evaluating policy-grounded prior authorization workflows. It uses synthetic patient data and a limited set of CMS policies and is not intended to make production clinical or coverage determinations.
