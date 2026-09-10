@@ -1,6 +1,6 @@
 # Prior Auth Agent
 
-A RAG-grounded prior authorization agent that decides whether a requested procedure meets Medicare coverage criteria and produces an auditable, citation-backed rationale for every decision.
+A RAG prior authorization agent that decides whether a requested procedure meets Medicare coverage criteria and produces an auditable, citation-backed rationale for every decision.
 
 Grounded retrieval. Three CMS Local Coverage Determinations are parsed, chunked, embedded with a sentence-transformer from Hugging Face, and indexed in FAISS (disk-cached after first build). At decision time the top-matching policy passages for the requested procedure are injected as the only permissible source, and the model must return a fixed DECISION / REASONING / POLICY CITATION structure quoting the exact clause it relied on. Citations are scored for verbatim groundedness against the retrieved context as a hallucination check.
 
