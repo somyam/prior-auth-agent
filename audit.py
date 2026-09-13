@@ -1,4 +1,5 @@
 """SQLite-backed audit log for prior authorization decisions."""
+import json
 import os
 import sqlite3
 
@@ -13,7 +14,10 @@ CREATE TABLE IF NOT EXISTS prior_auth_audit_log (
     decision TEXT,
     reasoning TEXT,
     timestamp TEXT,
-    response_time_seconds REAL
+    response_time_seconds REAL,
+    tool_trace TEXT,
+    assessment TEXT,
+    policy_evidence TEXT
 )
 """
 
@@ -21,6 +25,10 @@ CREATE TABLE IF NOT EXISTS prior_auth_audit_log (
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.execute(SCHEMA)
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(prior_auth_audit_log)")}
+    for name in ("tool_trace", "assessment", "policy_evidence"):
+        if name not in existing:
+            conn.execute(f"ALTER TABLE prior_auth_audit_log ADD COLUMN {name} TEXT")
     return conn
 
 
@@ -29,8 +37,9 @@ def log_decision(result: dict) -> None:
     with conn:
         conn.execute(
             """INSERT INTO prior_auth_audit_log
-               (patient_id, diagnosis_code, procedure, decision, reasoning, timestamp, response_time_seconds)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               (patient_id, diagnosis_code, procedure, decision, reasoning, timestamp, response_time_seconds,
+                tool_trace, assessment, policy_evidence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 result["patient_id"],
                 result["diagnosis_code"],
@@ -39,6 +48,9 @@ def log_decision(result: dict) -> None:
                 result["reasoning"],
                 result["timestamp"],
                 result["response_time_seconds"],
+                json.dumps(result.get("tool_trace", [])),
+                json.dumps(result.get("assessment", {})),
+                result.get("policy_info", ""),
             ),
         )
     conn.close()

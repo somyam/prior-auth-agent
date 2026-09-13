@@ -37,7 +37,7 @@ def load_patients():
 
 
 st.title("⚕ Prior Authorization AI Agent")
-st.caption("RAG-grounded decisions over real CMS Medicare policy. All patient data is synthetic.")
+st.caption("All patient data is synthetic.")
 
 graph = load_graph()
 patients = load_patients()

@@ -41,6 +41,15 @@ def lookup_patient_fn(patients: pd.DataFrame, patient_id: str) -> str | None:
     )
 
 
+def patient_section_fn(patients: pd.DataFrame, patient_id: str, section: str) -> str | None:
+    """Return one whitelisted part of a record for the bounded evidence agent."""
+    match = patients[patients["patient_id"] == patient_id]
+    if match.empty or section not in {"conditions", "medications", "procedures"}:
+        return None
+    value = match.iloc[0][section]
+    return f"Patient {section}: {value if pd.notna(value) else 'not documented'}"
+
+
 def search_policy_fn(query: str, embedding_model, faiss_index, chunks, sources, k: int = 3) -> str:
     """Search the CMS policy FAISS index for the top-k most relevant chunks."""
     query_vector = embedding_model.encode([query])

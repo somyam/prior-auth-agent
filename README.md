@@ -6,7 +6,7 @@ The system automates a common prior authorization workflow: matching a procedure
 
 ## Architecture
 
-Requests move through a fixed workflow implemented as a [LangGraph](https://github.com/langchain-ai/langgraph) state graph. Each stage is represented as an isolated node, with explicit conditional routing for cases that should not proceed to model inference.
+Requests move through a bounded workflow implemented as a [LangGraph](https://github.com/langchain-ai/langgraph) state graph. After initial retrieval, an evidence agent can make a limited number of read-only, whitelisted tool calls to refine its policy search or inspect a specific patient-record section. Deterministic validation owns the final routing.
 
 ```text
                  ┌──────────────────┐
@@ -17,10 +17,14 @@ Requests move through a fixed workflow implemented as a [LangGraph](https://gith
         patient found            patient not found
               │                         │
               ▼                         ▼
-      policy retrieval             auto-deny
+      initial policy retrieval     auto-deny
               │                         │
               ▼                         │
-        model decision                  │
+  bounded evidence-agent loop            │
+  (policy search / patient inspection)   │
+              │                         │
+              ▼                         │
+     citation + criteria validator        │
               │                         │
               └───────────┬─────────────┘
                           ▼
@@ -28,6 +32,8 @@ Requests move through a fixed workflow implemented as a [LangGraph](https://gith
 ```
 
 If no matching patient record is found, the request is denied and logged without invoking the model. This prevents inference against an unverified or unavailable patient record.
+
+The agent has only two read-only tools: policy search and retrieval of one of three patient-record sections (conditions, medications, or procedures). It is capped at four calls. It must finalize with a structured criterion-by-criterion assessment. An approval requires every cited criterion to be documented as met; a denial requires a documented unmet criterion; missing or ambiguous evidence becomes `PENDED` for manual review. The verifier checks that every policy quote appears in the retrieved evidence before a decision is accepted.
 
 ## Policy Grounding
 
@@ -46,10 +52,10 @@ The decision prompt requires the model to identify the specific policy language 
 
 | File                 | Responsibility                                                            |
 | -------------------- | ------------------------------------------------------------------------- |
-| `graph.py`           | Defines the LangGraph workflow, conditional routing, and decision prompt  |
+| `graph.py`           | Defines the bounded LangGraph evidence-agent loop, routing, and validator |
 | `tools.py`           | Diagnosis-code lookup, patient-record lookup, and FAISS policy retrieval  |
 | `index.py`           | Parses, chunks, and embeds CMS policy PDFs and caches the resulting index |
-| `audit.py`           | Persists approvals, denials, and automatic denials to SQLite              |
+| `audit.py`           | Persists decisions plus the agent trace, assessment, and policy evidence  |
 | `app.py`             | Streamlit interface for submitting requests and reviewing the audit log   |
 | `data/patients.csv`  | Synthetic patient records; contains no real PHI                           |
 | `docs/cms_policies/` | CMS Local Coverage Determination PDFs used for retrieval                  |
@@ -60,11 +66,33 @@ The decision prompt requires the model to identify the specific policy language 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # add AWS Bedrock credentials
 streamlit run app.py
 ```
 
-On the first run, the application builds a FAISS index from the policy PDFs and stores it in `.cache/`. Subsequent runs load the cached index.
+By default, the app calls a local [Ollama generate endpoint](https://docs.ollama.com/api/generate) at `http://localhost:11434` with `llama3.1:8b`. Install Ollama, pull that model (or select another capable local model), and start its local service before launching the app:
+
+```bash
+ollama pull llama3.1:8b
+```
+
+Optional environment variables:
+
+```env
+LLM_PROVIDER=ollama
+OLLAMA_MODEL=llama3.1:8b
+OLLAMA_URL=http://localhost:11434/api/generate
+```
+
+Bedrock remains available as an opt-in provider for deployments that need it:
+
+```env
+LLM_PROVIDER=bedrock
+AWS_REGION=us-east-2
+AWS_ACCESS_KEY=your_access_key
+AWS_SECRET_KEY=your_secret_key
+```
+
+On the first run, the application downloads the embedding model, builds a FAISS index from the policy PDFs, and stores it in `.cache/`. Subsequent runs load the cached index.
 
 ## Evaluation
 
