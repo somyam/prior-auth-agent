@@ -1,45 +1,14 @@
 # Prior Auth Agent
 
-A policy-grounded prior authorization agent that evaluates whether a requested procedure meets Medicare coverage criteria and produces an auditable rationale tied to retrieved CMS policy language.
-
-The system automates a common prior authorization workflow: matching a procedure request and patient record against applicable coverage criteria. Rather than relying on the model's internal knowledge of Medicare policy, it retrieves relevant policy text and requires each model-generated decision to include a supporting citation.
+This RAG-based agent evaluates whether a requested procedure meets Medicare coverage criteria and produces an auditable rationale tied to retrieved CMS policy language.
 
 ## Architecture
 
-Requests move through a bounded workflow implemented as a [LangGraph](https://github.com/langchain-ai/langgraph) state graph. After initial retrieval, an evidence agent can make a limited number of read-only, whitelisted tool calls to refine its policy search or inspect a specific patient-record section. Deterministic validation owns the final routing.
-
-```text
-                 ┌──────────────────┐
-   diagnosis ──> │  patient lookup  │
-   lookup        └────────┬─────────┘
-                          │
-              ┌───────────┴────────────┐
-        patient found            patient not found
-              │                         │
-              ▼                         ▼
-      initial policy retrieval     auto-deny
-              │                         │
-              ▼                         │
-  bounded evidence-agent loop            │
-  (policy search / patient inspection)   │
-              │                         │
-              ▼                         │
-     citation + criteria validator        │
-              │                         │
-              └───────────┬─────────────┘
-                          ▼
-                     audit record
-```
-
-If no matching patient record is found, the request is denied and logged without invoking the model. This prevents inference against an unverified or unavailable patient record.
-
-The agent has only two read-only tools: policy search and retrieval of one of three patient-record sections (conditions, medications, or procedures). It is capped at four calls. It must finalize with a structured criterion-by-criterion assessment. An approval requires every cited criterion to be documented as met; a denial requires a documented unmet criterion; missing or ambiguous evidence becomes `PENDED` for manual review. The verifier checks that every policy quote appears in the retrieved evidence before a decision is accepted.
+Requests move through a bounded workflow implemented as a [LangGraph](https://github.com/langchain-ai/langgraph) state graph. After initial retrieval, an evidence agent can make a limited number of read-only tool calls to refine its policy search or inspect a specific patient-record section. 
 
 ## Policy Grounding
 
-The model is restricted to retrieved CMS policy text rather than its pretrained knowledge of Medicare coverage rules.
-
-Three CMS Local Coverage Determinations (LCDs) in `docs/cms_policies/` are:
+Three CMS Local Coverage Determinations (LCDs) included in `docs/cms_policies/` are:
 
 1. Parsed and split into chunks.
 2. Embedded and indexed with FAISS at startup.
@@ -47,19 +16,6 @@ Three CMS Local Coverage Determinations (LCDs) in `docs/cms_policies/` are:
 4. Passed to the model alongside the relevant patient record.
 
 The decision prompt requires the model to identify the specific policy language supporting its conclusion. This provides a traceable relationship between the generated decision and the retrieved source material and allows citations to be evaluated independently for groundedness.
-
-## Repository Structure
-
-| File                 | Responsibility                                                            |
-| -------------------- | ------------------------------------------------------------------------- |
-| `graph.py`           | Defines the bounded LangGraph evidence-agent loop, routing, and validator |
-| `tools.py`           | Diagnosis-code lookup, patient-record lookup, and FAISS policy retrieval  |
-| `index.py`           | Parses, chunks, and embeds CMS policy PDFs and caches the resulting index |
-| `audit.py`           | Persists decisions plus the agent trace, assessment, and policy evidence  |
-| `app.py`             | Streamlit interface for submitting requests and reviewing the audit log   |
-| `data/patients.csv`  | Synthetic patient records; contains no real PHI                           |
-| `docs/cms_policies/` | CMS Local Coverage Determination PDFs used for retrieval                  |
-| `eval/`              | Evaluation cases and evaluation harness                                   |
 
 ## Running Locally
 
@@ -118,7 +74,3 @@ Run the evaluation suite with:
 ```bash
 PYTHONPATH=. python3 eval/run_eval.py
 ```
-
-## Scope
-
-This repository is a prototype for evaluating policy-grounded prior authorization workflows. It uses synthetic patient data and a limited set of CMS policies and is not intended to make production clinical or coverage determinations.
