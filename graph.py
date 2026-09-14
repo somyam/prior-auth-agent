@@ -48,17 +48,21 @@ class PriorAuthState(TypedDict, total=False):
     response_time_seconds: float
 
 
-def _load_components():
+def create_model_client():
+    """Create the optional remote client; local Ollama needs no Python client."""
     if LLM_PROVIDER == "bedrock":
-        model_client = boto3.client(
+        return boto3.client(
             service_name="bedrock-runtime", region_name=AWS_REGION,
             aws_access_key_id=os.getenv("AWS_ACCESS_KEY"),
             aws_secret_access_key=os.getenv("AWS_SECRET_KEY"),
         )
-    elif LLM_PROVIDER == "ollama":
-        model_client = None
-    else:
-        raise ValueError("LLM_PROVIDER must be either 'ollama' or 'bedrock'.")
+    if LLM_PROVIDER == "ollama":
+        return None
+    raise ValueError("LLM_PROVIDER must be either 'ollama' or 'bedrock'.")
+
+
+def _load_components():
+    model_client = create_model_client()
     embedding_model, faiss_index, chunks, sources = build_index()
     return model_client, embedding_model, faiss_index, chunks, sources, pd.read_csv(PATIENTS_CSV)
 

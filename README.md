@@ -1,6 +1,6 @@
 # Prior Auth Agent
 
-This RAG-based agent evaluates whether a requested procedure meets Medicare coverage criteria and produces an auditable rationale tied to retrieved CMS policy language.
+This RAG-based agent with an eval harness evaluates whether a requested procedure meets Medicare coverage criteria and produces an auditable rationale tied to retrieved CMS policy language. 
 
 ## Architecture
 
@@ -60,6 +60,8 @@ Instead, `eval/run_eval.py` evaluates properties that can be verified directly a
 * **Diagnosis/procedure mismatch — 8/8:** Requests with an unrelated diagnosis and procedure must be denied when the retrieved policy provides no basis for coverage.
 * **Citation groundedness — ~0.90 mean:** Measures the extent to which cited policy text can be traced verbatim to the retrieved context supplied to the model. This is used as a proxy for unsupported or hallucinated citations.
 * **Output-format compliance — 100%:** Measures whether responses conform to the required `DECISION / REASONING / POLICY CITATION` structure.
+* **Semantic rubric:** A separate LLM-as-a-judge scores citation entailment and decision support using only the retrieved policy evidence. A well-grounded `PENDED` response can pass when manual review is appropriate.
+* **Operational metrics:** Mean, p50, and p95 latency; mean and maximum tool calls; manual-review rate; errors; and a pass/fail check against a 120-second / five-tool-call ceiling.
 
 Cases in which the diagnosis and procedure are clinically aligned—for example, low back pain with lumbar MRI—are executed and logged but are not assigned an accuracy score. The available synthetic records do not contain enough information to establish a defensible coverage ground truth for these cases. They are therefore intended for qualitative review of retrieval and reasoning behavior.
 
@@ -73,4 +75,10 @@ Run the evaluation suite with:
 
 ```bash
 PYTHONPATH=. python3 eval/run_eval.py
+```
+
+To run deterministic and operational checks without the additional judge call for each non-auto-deny case:
+
+```bash
+PYTHONPATH=. python3 eval/run_eval.py --skip-semantic-judge
 ```
