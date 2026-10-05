@@ -4,6 +4,8 @@ This RAG-based agent with an eval harness evaluates whether a requested procedur
 
 ## Architecture
 
+<img width="759" height="1110" alt="Screenshot 2026-10-04 at 7 32 31 PM" src="https://github.com/user-attachments/assets/80458d86-5b7e-4ff0-bc6d-a5ec5edc579b" />
+
 Requests move through a bounded workflow implemented as a [LangGraph](https://github.com/langchain-ai/langgraph) state graph. After initial retrieval, an evidence agent can make a limited number of read-only tool calls to refine its policy search or inspect a specific patient-record section. 
 
 ## Policy Grounding
