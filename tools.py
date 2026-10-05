@@ -50,12 +50,24 @@ def patient_section_fn(patients: pd.DataFrame, patient_id: str, section: str) ->
     return f"Patient {section}: {value if pd.notna(value) else 'not documented'}"
 
 
-def search_policy_fn(query: str, embedding_model, faiss_index, chunks, sources, k: int = 3) -> str:
-    """Search the CMS policy FAISS index for the top-k most relevant chunks."""
+def search_policy_fn(
+    query: str, embedding_model, faiss_index, chunks, sources, k: int = 3, exclude_indices: set[int] | None = None
+) -> tuple[str, list[int]]:
+    """Search the CMS policy FAISS index for the top-k most relevant chunks.
+
+    Chunks already seen in this request (``exclude_indices``) are skipped so a follow-up
+    search surfaces new evidence instead of repeating the same top-k result. Returns the
+    formatted text alongside the chunk indices actually used, so callers can accumulate
+    what's been searched across the agent loop.
+    """
+    exclude_indices = exclude_indices or set()
+    fetch_k = min(len(chunks), k + len(exclude_indices))
     query_vector = embedding_model.encode([query])
-    _, indices = faiss_index.search(np.array(query_vector, dtype=np.float32), k)
+    _, indices = faiss_index.search(np.array(query_vector, dtype=np.float32), fetch_k)
+    novel = [int(idx) for idx in indices[0] if int(idx) not in exclude_indices][:k]
+    selected = novel or [int(idx) for idx in indices[0][:k]]  # exhausted: fall back to nearest anyway
     results = [
         f"Source: {sources[idx]}\nContent: {chunks[idx][:500]}"
-        for idx in indices[0]
+        for idx in selected
     ]
-    return "\n\n---\n\n".join(results)
+    return "\n\n---\n\n".join(results), selected

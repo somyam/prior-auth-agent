@@ -7,3 +7,4 @@ numpy
 PyMuPDF
 python-dotenv
 langgraph
+langgraph-checkpoint-sqlite

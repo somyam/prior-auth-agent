@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import sqlite3
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -11,7 +12,9 @@ from typing import Any, TypedDict
 import boto3
 import pandas as pd
 from dotenv import load_dotenv
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 
 import audit
 from index import build_index
@@ -20,6 +23,7 @@ from tools import lookup_diagnosis_fn, lookup_patient_fn, patient_section_fn, se
 load_dotenv()
 AWS_REGION = os.getenv("AWS_REGION", "us-east-2")
 PATIENTS_CSV = os.path.join(os.path.dirname(__file__), "data", "patients.csv")
+CHECKPOINT_DB_PATH = os.path.join(os.path.dirname(__file__), "checkpoints.db")
 MODEL_ID = "us.meta.llama3-1-8b-instruct-v1:0"
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
@@ -39,12 +43,14 @@ class PriorAuthState(TypedDict, total=False):
     patient_info: str
     patient_found: bool
     policy_info: str
+    searched_chunks: list[int]
     tool_trace: list[dict[str, Any]]
     agent_steps: int
     agent_action: dict[str, Any]
     assessment: dict[str, Any]
     decision: str
     reasoning: str
+    decided_at: str
     response_time_seconds: float
 
 
@@ -139,7 +145,7 @@ def build_graph():
     model_client, embedding_model, faiss_index, chunks, sources, patients = _load_components()
 
     def node_start(_: PriorAuthState) -> dict:
-        return {"start_time": datetime.now().isoformat(), "tool_trace": [], "agent_steps": 0}
+        return {"start_time": datetime.now().isoformat(), "tool_trace": [], "agent_steps": 0, "searched_chunks": []}
 
     def node_lookup_diagnosis(state: PriorAuthState) -> dict:
         return {"diagnosis_info": lookup_diagnosis_fn(state["diagnosis_code"])}
@@ -154,12 +160,19 @@ def build_graph():
     def node_unknown_patient(_: PriorAuthState) -> dict:
         assessment = _manual_review("No matching patient record was found; a verified history is required.")
         assessment["decision"] = "DENIED"
-        return {"policy_info": "", "assessment": assessment, "decision": "DENIED", "reasoning": _format_assessment(assessment)}
+        return {
+            "policy_info": "", "assessment": assessment, "decision": "DENIED",
+            "reasoning": _format_assessment(assessment), "decided_at": datetime.now().isoformat(),
+        }
 
     def node_initial_policy_search(state: PriorAuthState) -> dict:
         query = f"{state['procedure']} {state['diagnosis_info']} coverage criteria medical necessity"
-        result = search_policy_fn(query, embedding_model, faiss_index, chunks, sources)
-        return {"policy_info": result, "tool_trace": [{"tool": "search_policy", "query": query, "result": result}]}
+        result, indices = search_policy_fn(query, embedding_model, faiss_index, chunks, sources)
+        return {
+            "policy_info": result,
+            "tool_trace": [{"tool": "search_policy", "query": query, "result": result}],
+            "searched_chunks": indices,
+        }
 
     def node_agent(state: PriorAuthState) -> dict:
         forced_finalize = state["agent_steps"] >= MAX_AGENT_STEPS
@@ -174,6 +187,9 @@ Requested procedure: {state['procedure']}
 
 POLICY EVIDENCE
 {state.get('policy_info', '')[:6000]}
+
+SEARCH STATUS
+{len(state.get('searched_chunks', []))} policy chunk(s) retrieved so far, from {len({sources[i] for i in state.get('searched_chunks', [])})} source document(s). If this evidence is not enough to decide, call search_policy again with a different, more specific query — you will get different chunks than the ones shown above, not a repeat of them.
 
 TOOL TRACE
 {json.dumps(state.get('tool_trace', [])[-4:])[:5000]}
@@ -202,9 +218,18 @@ criterion is not_documented, evidence is ambiguous, or policy evidence is insuff
         action, trace = state["agent_action"], list(state.get("tool_trace", []))
         if action["action"] == "search_policy":
             query = str(action.get("query", "")).strip()[:300]
-            result = search_policy_fn(query, embedding_model, faiss_index, chunks, sources) if query else "Tool error: a policy-search query is required."
+            seen = set(state.get("searched_chunks", []))
+            if query:
+                result, new_indices = search_policy_fn(query, embedding_model, faiss_index, chunks, sources, exclude_indices=seen)
+            else:
+                result, new_indices = "Tool error: a policy-search query is required.", []
             trace.append({"tool": "search_policy", "query": query, "result": result})
-            return {"policy_info": f"{state.get('policy_info', '')}\n\n--- FOLLOW-UP SEARCH ---\n{result}", "tool_trace": trace, "agent_steps": state["agent_steps"] + 1}
+            return {
+                "policy_info": f"{state.get('policy_info', '')}\n\n--- FOLLOW-UP SEARCH ---\n{result}",
+                "tool_trace": trace,
+                "agent_steps": state["agent_steps"] + 1,
+                "searched_chunks": list(seen | set(new_indices)),
+            }
         section = str(action.get("section", "")).lower()
         result = patient_section_fn(patients, state["patient_id"], section) if section in ALLOWED_SECTIONS else None
         trace.append({"tool": "inspect_patient", "section": section, "result": result or "Tool error: unsupported or empty patient section."})
@@ -231,10 +256,37 @@ criterion is not_documented, evidence is ambiguous, or policy evidence is insuff
                 assessment = _manual_review("Denial was not tied to a documented unmet policy criterion.")
             elif decision == "PENDED" and not valid:
                 assessment = _manual_review("Policy evidence was insufficient for a verifiable assessment.")
-        return {"assessment": assessment, "decision": assessment["decision"], "reasoning": _format_assessment(assessment)}
+        return {
+            "assessment": assessment, "decision": assessment["decision"],
+            "reasoning": _format_assessment(assessment), "decided_at": datetime.now().isoformat(),
+        }
+
+    def node_human_review(state: PriorAuthState) -> dict:
+        """Pause on a PENDED result until a reviewer resumes with Command(resume={...}).
+
+        Re-executes from the top of this node on resume, per LangGraph's interrupt
+        semantics, so everything before the interrupt() call must stay side-effect-free.
+        """
+        review = interrupt({
+            "patient_id": state["patient_id"],
+            "diagnosis_code": state["diagnosis_code"],
+            "procedure": state["procedure"],
+            "reasoning": state["reasoning"],
+            "assessment": state.get("assessment", {}),
+        })
+        decision = str(review.get("decision", "")).upper() if isinstance(review, dict) else ""
+        if decision not in ALLOWED_DECISIONS:
+            return {}
+        notes = str(review.get("reviewer_notes", "")).strip() if isinstance(review, dict) else ""
+        assessment = {**state.get("assessment", {}), "human_reviewed": True, "human_decision": decision, "human_notes": notes}
+        reasoning = f"{state['reasoning']}\n\nHUMAN REVIEW: {decision}" + (f" — {notes}" if notes else "")
+        return {"decision": decision, "reasoning": reasoning, "assessment": assessment}
+
+    def route_after_verify(state: PriorAuthState) -> str:
+        return "human_review" if state["decision"] == "PENDED" else "audit"
 
     def node_audit_log(state: PriorAuthState) -> dict:
-        elapsed = (datetime.now() - datetime.fromisoformat(state["start_time"])).total_seconds()
+        elapsed = (datetime.fromisoformat(state["decided_at"]) - datetime.fromisoformat(state["start_time"])).total_seconds()
         audit.log_decision({
             "patient_id": state["patient_id"], "diagnosis_code": state["diagnosis_code"], "procedure": state["procedure"],
             "decision": state["decision"], "reasoning": state["reasoning"], "timestamp": state["start_time"],
@@ -247,7 +299,8 @@ criterion is not_documented, evidence is ambiguous, or policy evidence is insuff
     for name, node in {
         "start": node_start, "lookup_diagnosis": node_lookup_diagnosis, "lookup_patient": node_lookup_patient,
         "unknown_patient": node_unknown_patient, "initial_policy_search": node_initial_policy_search,
-        "agent": node_agent, "execute_tool": node_execute_tool, "verify": node_verify, "audit": node_audit_log,
+        "agent": node_agent, "execute_tool": node_execute_tool, "verify": node_verify,
+        "human_review": node_human_review, "audit": node_audit_log,
     }.items():
         builder.add_node(name, node)
     builder.add_edge(START, "start")
@@ -257,7 +310,9 @@ criterion is not_documented, evidence is ambiguous, or policy evidence is insuff
     builder.add_edge("initial_policy_search", "agent")
     builder.add_conditional_edges("agent", route_after_agent, {"execute_tool": "execute_tool", "verify": "verify"})
     builder.add_edge("execute_tool", "agent")
-    builder.add_edge("verify", "audit")
+    builder.add_conditional_edges("verify", route_after_verify, {"human_review": "human_review", "audit": "audit"})
+    builder.add_edge("human_review", "audit")
     builder.add_edge("unknown_patient", "audit")
     builder.add_edge("audit", END)
-    return builder.compile()
+    checkpointer = SqliteSaver(sqlite3.connect(CHECKPOINT_DB_PATH, check_same_thread=False))
+    return builder.compile(checkpointer=checkpointer)

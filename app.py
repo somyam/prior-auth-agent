@@ -1,6 +1,9 @@
 """Streamlit UI for the prior authorization agent."""
+import uuid
+
 import pandas as pd
 import streamlit as st
+from langgraph.types import Command
 
 import audit
 from graph import PATIENTS_CSV, build_graph
@@ -49,19 +52,48 @@ with st.form("prior_auth_form"):
     submitted = st.form_submit_button("Run prior authorization review")
 
 if submitted:
+    diagnosis_code = DIAGNOSIS_OPTIONS[diagnosis_label]
+    thread_id = str(uuid.uuid4())
     with st.spinner("Reviewing against CMS policy..."):
-        result = graph.invoke({
-            "patient_id": patient_id,
-            "diagnosis_code": DIAGNOSIS_OPTIONS[diagnosis_label],
-            "procedure": procedure,
-        })
+        result = graph.invoke(
+            {"patient_id": patient_id, "diagnosis_code": diagnosis_code, "procedure": procedure},
+            {"configurable": {"thread_id": thread_id}},
+        )
 
-    if result["decision"] == "APPROVED":
-        st.success(result["decision"])
+    if result.get("__interrupt__"):
+        audit.queue_for_review(thread_id, patient_id, diagnosis_code, procedure, result["reasoning"])
+        st.warning(f"PENDED — queued for manual review (case {thread_id[:8]}).")
+        st.write(result["reasoning"])
     else:
-        st.error(result["decision"])
-    st.write(result["reasoning"])
-    st.caption(f"⏱ {result['response_time_seconds']:.2f}s")
+        if result["decision"] == "APPROVED":
+            st.success(result["decision"])
+        else:
+            st.error(result["decision"])
+        st.write(result["reasoning"])
+        st.caption(f"⏱ {result['response_time_seconds']:.2f}s")
+
+st.divider()
+st.subheader("Pending manual reviews")
+pending = audit.fetch_pending_reviews()
+if pending:
+    options = {f"{pid} · {dx} · {proc} (queued {queued_at})": tid for tid, pid, dx, proc, _, queued_at in pending}
+    choice = st.selectbox("Case awaiting review", list(options.keys()))
+    thread_id, _, _, _, reasoning, _ = next(row for row in pending if row[0] == options[choice])
+    st.write(reasoning)
+    with st.form("review_form"):
+        review_decision = st.radio("Reviewer decision", ["APPROVED", "DENIED", "PENDED"], horizontal=True)
+        reviewer_notes = st.text_input("Reviewer notes (optional)")
+        review_submitted = st.form_submit_button("Submit review")
+    if review_submitted:
+        final_state = graph.invoke(
+            Command(resume={"decision": review_decision, "reviewer_notes": reviewer_notes}),
+            {"configurable": {"thread_id": thread_id}},
+        )
+        audit.resolve_review(thread_id)
+        st.success(f"Recorded: {final_state['decision']}")
+        st.rerun()
+else:
+    st.caption("No cases awaiting review.")
 
 st.divider()
 st.subheader("Audit log")

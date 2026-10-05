@@ -90,11 +90,14 @@ def main():
     for case in load_cases():
         start = time.perf_counter()
         try:
-            state = agent.invoke({
-                "patient_id": case["patient_id"],
-                "diagnosis_code": case["diagnosis_code"],
-                "procedure": case["procedure"],
-            })
+            state = agent.invoke(
+                {
+                    "patient_id": case["patient_id"],
+                    "diagnosis_code": case["diagnosis_code"],
+                    "procedure": case["procedure"],
+                },
+                {"configurable": {"thread_id": f"eval-{case['id']}"}},
+            )
             elapsed = round(time.perf_counter() - start, 2)
             trace = state.get("tool_trace", [])
             row = {
